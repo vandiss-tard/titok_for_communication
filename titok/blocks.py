@@ -24,4 +24,56 @@ class PatchEmbed(nn.Module):
         x = self.proj(images)
         x = x.flatten(2).transpose(1,2)
         return x + self.pos_embed     # (B, N, D) + (1, N, D) 广播 N = H' * W'
-    
+
+
+class MLP(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        mlp_ratio: float,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+
+        hidden_dim = int(dim * mlp_ratio)
+
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, mlp_ratio, dropout)
+        self.dropout = nn.Dropout(dropout)
+#Pre-LN（这段代码）,先归一再残差。原始论文是先残差，再归一。最终输出没有经过 norm，通常需要在所有 block 之后再加一个 final_norm。
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        h, _ = self.attn(h, h, h, need_weights=False)
+        x = x + self.dropout(h)
+
+        x = x + self.dropout(self.mlp(self.norm2(x)))
+        return x

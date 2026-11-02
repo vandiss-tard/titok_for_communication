@@ -20,7 +20,7 @@ class PatchEmbed(nn.Module):
         '''可学习的位置编码（learnable positional embedding）先创建全 0 参数，再用截断正态随机填充；训练时这些值会被优化器不断更新。
         原地初始化为均值 0、标准差 0.02、范围约 [-0.04, 0.04] 的截断正态随机数'''
 
-    def forward(self, images:torch.tensor) -> torch.tensor:
+    def forward(self, images:torch.tensor) -> torch.Tensor:
         x = self.proj(images)
         x = x.flatten(2).transpose(1,2)
         return x + self.pos_embed     # (B, N, D) + (1, N, D) 广播 N = H' * W'
@@ -69,7 +69,7 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, mlp_ratio, dropout)
         self.dropout = nn.Dropout(dropout)
-#Pre-LN（这段代码）,先归一再残差。原始论文是先残差，再归一。最终输出没有经过 norm，通常需要在所有 block 之后再加一个 final_norm。
+#Pre-LN（这段代码）,先归一再残差。原始论文是先残差，再归一。这种最终输出没有经过 norm，通常需要在所有 block 之后再加一个 final_norm。
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm1(x)
         h, _ = self.attn(h, h, h, need_weights=False)
@@ -77,3 +77,48 @@ class TransformerBlock(nn.Module):
 
         x = x + self.dropout(self.mlp(self.norm2(x)))
         return x
+
+
+class LatentEncoder(nn.Module):
+    """把图像压缩成固定数量的 latent token。"""
+
+    def __init__(self, config: TiTokConfig) -> None:
+        super().__init__()
+
+        self.patch_embed = PatchEmbed(config)
+        self.latent_tokens = nn.Parameter(
+            torch.zeros(1, config.latent_tokens, config.hidden_dim)
+        )
+        self.latent_pos_embed = nn.Parameter(
+            torch.zeros(1, config.latent_tokens, config.hidden_dim)
+        )
+        nn.init.trunc_normal_(self.latent_tokens, std=0.02)
+        nn.init.trunc_normal_(self.latent_pos_embed, std=0.02)
+
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    dim=config.hidden_dim,
+                    num_heads=config.num_heads,
+                    mlp_ratio=config.mlp_ratio,
+                    dropout=config.dropout,
+                )
+                for _ in range(config.depth)
+            ]
+        )
+
+        self.norm = nn.LayerNorm(config.hidden_dim)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        patches = self.patch_embed(images)
+
+        latents = self.latent_tokens + self.latent_pos_embed
+        latents = latents.expand(images.shape[0], -1, -1)
+
+        x = torch.cat([latents, patches], dim=1)
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm(x)
+        return x[:, : self.latent_tokens.shape[1]]

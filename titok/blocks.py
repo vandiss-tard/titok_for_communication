@@ -1,13 +1,16 @@
+from __future__ import annotations
+
 import torch
 from torch import nn
-from titok.config import TiTokConfig
 from torch.nn import functional as F
+
+from titok.config import TiTokConfig
 
 
 class PatchEmbed(nn.Module):
     """把图像切分成 patch token。"""
 
-    def __init__(self, config: TiTokConfig) -> None: #-> None返回值类型注解，表示这个函数返回 None
+    def __init__(self, config: TiTokConfig) -> None:
         super().__init__()
 
         self.proj = nn.Conv2d(
@@ -16,16 +19,15 @@ class PatchEmbed(nn.Module):
             kernel_size=config.patch_size,
             stride=config.patch_size,
         )
-
-        self.pos_embed = nn.Parameter(torch.zeros(1, config.num_patches, config.hidden_dim))
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, config.num_patches, config.hidden_dim)
+        )
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        '''可学习的位置编码（learnable positional embedding）先创建全 0 参数，再用截断正态随机填充；训练时这些值会被优化器不断更新。
-        原地初始化为均值 0、标准差 0.02、范围约 [-0.04, 0.04] 的截断正态随机数'''
 
-    def forward(self, images:torch.tensor) -> torch.Tensor:
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
         x = self.proj(images)
-        x = x.flatten(2).transpose(1,2)
-        return x + self.pos_embed     # (B, N, D) + (1, N, D) 广播 N = H' * W'
+        x = x.flatten(2).transpose(1, 2)
+        return x + self.pos_embed
 
 
 class MLP(nn.Module):
@@ -72,7 +74,7 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, mlp_ratio, dropout)
         self.dropout = nn.Dropout(dropout)
-#Pre-LN（这段代码）,先归一再残差。原始论文是先残差，再归一。这种最终输出没有经过 norm，通常需要在所有 block 之后再加一个 final_norm。
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm1(x)
         h, _ = self.attn(h, h, h, need_weights=False)
@@ -83,20 +85,31 @@ class TransformerBlock(nn.Module):
 
 
 class LatentEncoder(nn.Module):
-    """把图像压缩成固定数量的 latent token。"""
+    """把图像编码成固定数量的 1D latent token。"""
 
     def __init__(self, config: TiTokConfig) -> None:
         super().__init__()
 
+        self.num_patches = config.num_patches
+        self.num_latent_tokens = config.latent_tokens
+
         self.patch_embed = PatchEmbed(config)
+
+        self.class_token = nn.Parameter(
+            torch.zeros(1, 1, config.hidden_dim)
+        )
         self.latent_tokens = nn.Parameter(
             torch.zeros(1, config.latent_tokens, config.hidden_dim)
         )
         self.latent_pos_embed = nn.Parameter(
             torch.zeros(1, config.latent_tokens, config.hidden_dim)
         )
+
+        nn.init.trunc_normal_(self.class_token, std=0.02)
         nn.init.trunc_normal_(self.latent_tokens, std=0.02)
         nn.init.trunc_normal_(self.latent_pos_embed, std=0.02)
+
+        self.ln_pre = nn.LayerNorm(config.hidden_dim)
 
         self.blocks = nn.ModuleList(
             [
@@ -110,76 +123,233 @@ class LatentEncoder(nn.Module):
             ]
         )
 
-        self.norm = nn.LayerNorm(config.hidden_dim)
+        self.ln_post = nn.LayerNorm(config.hidden_dim)
+        self.to_token_size = nn.Linear(
+            config.hidden_dim,
+            config.token_size,
+        )
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
+        batch_size = images.shape[0]
+
         patches = self.patch_embed(images)
+        class_token = self.class_token.expand(
+            batch_size,
+            -1,
+            -1,
+        )
+        latents = (
+            self.latent_tokens + self.latent_pos_embed
+        ).expand(batch_size, -1, -1)
 
-        latents = self.latent_tokens + self.latent_pos_embed
-        latents = latents.expand(images.shape[0], -1, -1) # batch 维从 1 扩展到当前 batch 大小，让每个样本都能拿到一组 latent token。-1表示该维度不变
-
-        x = torch.cat([latents, patches], dim=1)
+        x = torch.cat(
+            [class_token, patches, latents],
+            dim=1,
+        )
+        x = self.ln_pre(x)
 
         for block in self.blocks:
             x = block(x)
 
-        x = self.norm(x)
-        '''等价于
-        x = self.blocks[0](x)
-        x = self.blocks[1](x)
-        x = self.blocks[2](x)
-        ...
-        x = self.blocks[depth - 1](x)
-        '''
-        return x[:, : self.latent_tokens.shape[1]]
-        '''
-        x.shape == (B, L + N, D)
-        :：第 0 维（batch）全取，B 个样本都保留
-        : self.latent_tokens.shape[1]：第 1 维取 [0, L)，即前 L 个 token
-        '''
+        x = self.ln_post(x)
+
+        latent_start = 1 + self.num_patches
+        latent_end = latent_start + self.num_latent_tokens
+        latents = x[:, latent_start:latent_end]
+
+        return self.to_token_size(latents)
 
 
 class VectorQuantizer(nn.Module):
-    """把连续 latent 映射到 VQ 码本编号。"""
+    """L2 归一化、EMA 更新和死码重启的向量量化器。"""
 
     def __init__(self, config: TiTokConfig) -> None:
         super().__init__()
 
+        self.codebook_size = config.codebook_size
+        self.token_size = config.token_size
         self.commitment_weight = config.commitment_weight
-        self.codebook = nn.Embedding( 
+        self.ema_decay = config.ema_decay
+        self.ema_eps = config.ema_eps
+
+        self.dead_code_threshold = config.dead_code_threshold
+        self.dead_code_restart_interval = (
+            config.dead_code_restart_interval
+        )
+        self.max_restart_codes = config.max_restart_codes
+
+        codebook = torch.randn(
             config.codebook_size,
-            config.hidden_dim,
+            config.token_size,
         )
-        self.codebook.weight.data.uniform_( ##初始化为 [-1/K, 1/K] 的均匀分布
-            -1.0 / config.codebook_size,
-            1.0 / config.codebook_size,
+        codebook = F.normalize(codebook, dim=-1)
+
+        self.register_buffer("codebook", codebook)
+        self.register_buffer(
+            "cluster_size",
+            torch.ones(config.codebook_size),
         )
+        self.register_buffer(
+            "codebook_sum",
+            codebook.clone(),
+        )
+        self.register_buffer(
+            "steps_since_used",
+            torch.zeros(
+                config.codebook_size,
+                dtype=torch.long,
+            ),
+        )
+        self.register_buffer(
+            "restart_step",
+            torch.zeros((), dtype=torch.long),
+        )
+
+    @torch.no_grad()
+    def _update_code_usage(
+        self,
+        indices: torch.Tensor,
+    ) -> None:
+        used = torch.zeros(
+            self.codebook_size,
+            dtype=torch.bool,
+            device=indices.device,
+        )
+        used[indices] = True
+
+        self.steps_since_used[used] = 0
+        self.steps_since_used[~used] += 1
+
+    @torch.no_grad()
+    def _ema_update(
+        self,
+        z_norm: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> None:
+        one_hot = F.one_hot(
+            indices,
+            self.codebook_size,
+        ).to(z_norm.dtype)
+
+        batch_cluster_size = one_hot.sum(dim=0)
+        batch_codebook_sum = one_hot.transpose(0, 1) @ z_norm
+
+        decay = self.ema_decay
+        update = 1.0 - decay
+
+        self.cluster_size.mul_(decay).add_(
+            batch_cluster_size,
+            alpha=update,
+        )
+        self.codebook_sum.mul_(decay).add_(
+            batch_codebook_sum,
+            alpha=update,
+        )
+
+        total = self.cluster_size.sum()
+        cluster_size = (
+            (self.cluster_size + self.ema_eps)
+            / (
+                total
+                + self.codebook_size * self.ema_eps
+            )
+            * total
+        )
+
+        self.codebook.copy_(
+            self.codebook_sum / cluster_size.unsqueeze(1)
+        )
+        self.codebook.copy_(
+            F.normalize(self.codebook, dim=-1)
+        )
+
+    @torch.no_grad()
+    def _restart_dead_codes(
+        self,
+        z_norm: torch.Tensor,
+    ) -> None:
+        self.restart_step += 1
+
+        if (
+            self.restart_step.item()
+            % self.dead_code_restart_interval
+            != 0
+        ):
+            return
+
+        dead_codes = torch.nonzero(
+            self.steps_since_used
+            >= self.dead_code_threshold,
+            as_tuple=False,
+        ).flatten()
+
+        if dead_codes.numel() == 0:
+            return
+
+        restart_count = min(
+            dead_codes.numel(),
+            self.max_restart_codes,
+        )
+
+        order = torch.randperm(
+            dead_codes.numel(),
+            device=dead_codes.device,
+        )
+        restart_codes = dead_codes[order[:restart_count]]
+
+        random_positions = torch.randint(
+            0,
+            z_norm.shape[0],
+            (restart_count,),
+            device=z_norm.device,
+        )
+        replacement = z_norm[random_positions].detach()
+
+        self.codebook[restart_codes] = replacement
+        self.codebook_sum[restart_codes] = replacement
+        self.cluster_size[restart_codes] = 1.0
+        self.steps_since_used[restart_codes] = 0
 
     def forward(
         self,
         z: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, num_tokens, dim = z.shape
-        z_flat = z.reshape(-1, dim)  #新形状为(-1, D)，-1让pytorch自己算
+        z_flat = z.reshape(-1, dim).float()
 
-#torch.cdist(A, B) 计算 A 最后一维中每一行到 B最后一维 中每一行的欧氏距离
+        z_norm = F.normalize(z_flat, dim=-1)
+        codebook_norm = F.normalize(
+            self.codebook,
+            dim=-1,
+        )
+
         distances = torch.cdist(
-            z_flat.float(),
-            self.codebook.weight.float(),
+            z_norm,
+            codebook_norm,
         )
-        indices = distances.argmin(dim=1)#沿着第 1 维（K （码本向量数）这一维）去找最小值，并返回它在第 1 维上的位置
-        quantized = self.codebook(indices) #n.Embedding 的前向就是按索引取行
-        quantized = quantized.view(batch_size, num_tokens, dim)
+        indices = distances.argmin(dim=1)
 
-        codebook_loss = F.mse_loss(quantized, z.detach())
-        commitment_loss = F.mse_loss(z, quantized.detach())
-        vq_loss = (
-            codebook_loss
-            + self.commitment_weight * commitment_loss
+        quantized_norm = codebook_norm[indices]
+
+        if self.training:
+            self._update_code_usage(indices)
+            self._ema_update(z_norm, indices)
+            self._restart_dead_codes(z_norm)
+
+        commitment_loss = F.mse_loss(
+            z_norm,
+            quantized_norm.detach(),
         )
+        vq_loss = self.commitment_weight * commitment_loss
 
-        # Straight-through estimator
-        quantized = z + (quantized - z).detach()
+        quantized = z_norm + (
+            quantized_norm - z_norm
+        ).detach()
+        quantized = quantized.view(
+            batch_size,
+            num_tokens,
+            dim,
+        )
 
         return (
             quantized,
@@ -188,93 +358,53 @@ class VectorQuantizer(nn.Module):
         )
 
     def lookup(self, indices: torch.Tensor) -> torch.Tensor:
-        return self.codebook(indices)
+        quantized = self.codebook[indices].float()
+        return F.normalize(quantized, dim=-1)
 
-
-class DecoderBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-
-        self.norm1 = nn.LayerNorm(dim)
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-
-        self.norm2 = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-
-        self.norm3 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, mlp_ratio, dropout)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        memory: torch.Tensor,
-    ) -> torch.Tensor:
-        h = self.norm1(x)
-        h, _ = self.self_attn(h, h, h, need_weights=False) #nn.MutiAttention在forward中返回(attn_output, attn_weights)
-        x = x + self.dropout(h)
-
-        h, _ = self.cross_attn(
-            self.norm2(x),
-            memory,
-            memory,
-            need_weights=False,
-        )
-        x = x + self.dropout(h)
-
-        x = x + self.dropout(self.mlp(self.norm3(x)))
-        return x
-        '''
-        attn_output, attn_weights = self.attn(
-    query,                    # (B, N_q, D)
-    key,                      # (B, N_k, D)
-    value,                    # (B, N_k, D)
-    key_padding_mask=None,    # (B, N_k)，True 表示该 key 是 padding，忽略
-    need_weights=True,        # 是否返回注意力权重
-    attn_mask=None,           # (N_q, N_k) 或 (B*num_heads, N_q, N_k)
-    average_attn_weights=True,# 多头权重是否平均
-    is_causal=False,          # True 时自动生成因果掩码
-)       
-        '''
 
 class LatentDecoder(nn.Module):
-    """把 latent token 重建为图像。"""
+    """使用联合自注意力把 latent token 重建为图像。"""
 
     def __init__(self, config: TiTokConfig) -> None:
         super().__init__()
 
         self.patch_size = config.patch_size
         self.in_channels = config.in_channels
+        self.num_patches = config.num_patches
         self.patches_per_side = config.image_size // config.patch_size
 
+        self.decoder_embed = nn.Linear(
+            config.token_size,
+            config.hidden_dim,
+        )
+
+        self.class_token = nn.Parameter(
+            torch.zeros(1, 1, config.hidden_dim)
+        )
         self.mask_token = nn.Parameter(
             torch.zeros(1, 1, config.hidden_dim)
         )
-        self.pos_embed = nn.Parameter(
+        self.mask_pos_embed = nn.Parameter(
             torch.zeros(1, config.num_patches, config.hidden_dim)
         )
+        self.latent_pos_embed = nn.Parameter(
+            torch.zeros(
+                1,
+                config.latent_tokens,
+                config.hidden_dim,
+            )
+        )
+
+        nn.init.trunc_normal_(self.class_token, std=0.02)
         nn.init.trunc_normal_(self.mask_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.mask_pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.latent_pos_embed, std=0.02)
+
+        self.ln_pre = nn.LayerNorm(config.hidden_dim)
 
         self.blocks = nn.ModuleList(
             [
-                DecoderBlock(
+                TransformerBlock(
                     dim=config.hidden_dim,
                     num_heads=config.num_heads,
                     mlp_ratio=config.mlp_ratio,
@@ -284,34 +414,77 @@ class LatentDecoder(nn.Module):
             ]
         )
 
-        self.norm = nn.LayerNorm(config.hidden_dim)
+        self.ln_post = nn.LayerNorm(config.hidden_dim)
 
         patch_dim = (
             config.patch_size
             * config.patch_size
             * config.in_channels
         )
-        self.head = nn.Linear(config.hidden_dim, patch_dim)
+        self.head = nn.Linear(
+            config.hidden_dim,
+            patch_dim,
+        )
+        self.output_conv = nn.Conv2d(
+            config.in_channels,
+            config.in_channels,
+            kernel_size=3,
+            padding=1,
+        )
 
     def forward(self, memory: torch.Tensor) -> torch.Tensor:
         batch_size = memory.shape[0]
 
-        x = self.mask_token.expand(batch_size, -1, -1)
-        x = x + self.pos_embed
+        memory = self.decoder_embed(memory)
+        memory = memory + self.latent_pos_embed
+
+        class_token = self.class_token.expand(
+            batch_size,
+            -1,
+            -1,
+        )
+        mask_tokens = self.mask_token.expand(
+            batch_size,
+            self.num_patches,
+            -1,
+        )
+        mask_tokens = mask_tokens + self.mask_pos_embed
+
+        x = torch.cat(
+            [class_token, mask_tokens, memory],
+            dim=1,
+        )
+        x = self.ln_pre(x)
 
         for block in self.blocks:
-            x = block(x, memory)
+            x = block(x)
 
-        x = self.norm(x)
-        x = self.head(x)
+        x = self.ln_post(x)
+
+        mask_output = x[:, 1 : 1 + self.num_patches]
+        patches = self.head(mask_output)
 
         side = self.patches_per_side
         p = self.patch_size
         c = self.in_channels
 
-        x = x.reshape(batch_size, side, side, p, p, c)
-        x = x.permute(0, 5, 1, 3, 2, 4)
-        return x.reshape(batch_size, c, side * p, side * p)
+        image = patches.reshape(
+            batch_size,
+            side,
+            side,
+            p,
+            p,
+            c,
+        )
+        image = image.permute(0, 5, 1, 3, 2, 4)
+        image = image.reshape(
+            batch_size,
+            c,
+            side * p,
+            side * p,
+        )
+
+        return self.output_conv(image)
 
 
 class TiTok(nn.Module):
@@ -334,7 +507,7 @@ class TiTok(nn.Module):
         reconstruction = self.decoder(quantized)
 
         return reconstruction, indices, vq_loss
-    
+
     @torch.no_grad()
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         latents = self.encoder(images)

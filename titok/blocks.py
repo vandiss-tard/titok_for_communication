@@ -189,3 +189,66 @@ class VectorQuantizer(nn.Module):
 
     def lookup(self, indices: torch.Tensor) -> torch.Tensor:
         return self.codebook(indices)
+
+
+class DecoderBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.norm3 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, mlp_ratio, dropout)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        memory: torch.Tensor,
+    ) -> torch.Tensor:
+        h = self.norm1(x)
+        h, _ = self.self_attn(h, h, h, need_weights=False) #nn.MutiAttention在forward中返回(attn_output, attn_weights)
+        x = x + self.dropout(h)
+
+        h, _ = self.cross_attn(
+            self.norm2(x),
+            memory,
+            memory,
+            need_weights=False,
+        )
+        x = x + self.dropout(h)
+
+        x = x + self.dropout(self.mlp(self.norm3(x)))
+        return x
+        '''
+        attn_output, attn_weights = self.attn(
+    query,                    # (B, N_q, D)
+    key,                      # (B, N_k, D)
+    value,                    # (B, N_k, D)
+    key_padding_mask=None,    # (B, N_k)，True 表示该 key 是 padding，忽略
+    need_weights=True,        # 是否返回注意力权重
+    attn_mask=None,           # (N_q, N_k) 或 (B*num_heads, N_q, N_k)
+    average_attn_weights=True,# 多头权重是否平均
+    is_causal=False,          # True 时自动生成因果掩码
+)       
+        '''

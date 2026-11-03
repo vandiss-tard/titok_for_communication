@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 from titok.config import TiTokConfig
+from torch.nn import functional as F
+
 
 class PatchEmbed(nn.Module):
     """把图像切分成 patch token。"""
@@ -47,6 +49,7 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
 
 class TransformerBlock(nn.Module):
     def __init__(
@@ -113,7 +116,7 @@ class LatentEncoder(nn.Module):
         patches = self.patch_embed(images)
 
         latents = self.latent_tokens + self.latent_pos_embed
-        latents = latents.expand(images.shape[0], -1, -1)
+        latents = latents.expand(images.shape[0], -1, -1) # batch 维从 1 扩展到当前 batch 大小，让每个样本都能拿到一组 latent token。-1表示该维度不变
 
         x = torch.cat([latents, patches], dim=1)
 
@@ -121,4 +124,68 @@ class LatentEncoder(nn.Module):
             x = block(x)
 
         x = self.norm(x)
+        '''等价于
+        x = self.blocks[0](x)
+        x = self.blocks[1](x)
+        x = self.blocks[2](x)
+        ...
+        x = self.blocks[depth - 1](x)
+        '''
         return x[:, : self.latent_tokens.shape[1]]
+        '''
+        x.shape == (B, L + N, D)
+        :：第 0 维（batch）全取，B 个样本都保留
+        : self.latent_tokens.shape[1]：第 1 维取 [0, L)，即前 L 个 token
+        '''
+
+
+class VectorQuantizer(nn.Module):
+    """把连续 latent 映射到 VQ 码本编号。"""
+
+    def __init__(self, config: TiTokConfig) -> None:
+        super().__init__()
+
+        self.commitment_weight = config.commitment_weight
+        self.codebook = nn.Embedding( 
+            config.codebook_size,
+            config.hidden_dim,
+        )
+        self.codebook.weight.data.uniform_( ##初始化为 [-1/K, 1/K] 的均匀分布
+            -1.0 / config.codebook_size,
+            1.0 / config.codebook_size,
+        )
+
+    def forward(
+        self,
+        z: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, num_tokens, dim = z.shape
+        z_flat = z.reshape(-1, dim)  #新形状为(-1, D)，-1让pytorch自己算
+
+#torch.cdist(A, B) 计算 A 最后一维中每一行到 B最后一维 中每一行的欧氏距离
+        distances = torch.cdist(
+            z_flat.float(),
+            self.codebook.weight.float(),
+        )
+        indices = distances.argmin(dim=1)#沿着第 1 维（K （码本向量数）这一维）去找最小值，并返回它在第 1 维上的位置
+        quantized = self.codebook(indices) #n.Embedding 的前向就是按索引取行
+        quantized = quantized.view(batch_size, num_tokens, dim)
+
+        codebook_loss = F.mse_loss(quantized, z.detach())
+        commitment_loss = F.mse_loss(z, quantized.detach())
+        vq_loss = (
+            codebook_loss
+            + self.commitment_weight * commitment_loss
+        )
+
+        # Straight-through estimator
+        quantized = z + (quantized - z).detach()
+
+        return (
+            quantized,
+            indices.view(batch_size, num_tokens),
+            vq_loss,
+        )
+
+    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.codebook(indices)

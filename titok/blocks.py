@@ -252,3 +252,63 @@ class DecoderBlock(nn.Module):
     is_causal=False,          # True 时自动生成因果掩码
 )       
         '''
+
+class LatentDecoder(nn.Module):
+    """把 latent token 重建为图像。"""
+
+    def __init__(self, config: TiTokConfig) -> None:
+        super().__init__()
+
+        self.patch_size = config.patch_size
+        self.in_channels = config.in_channels
+        self.patches_per_side = config.image_size // config.patch_size
+
+        self.mask_token = nn.Parameter(
+            torch.zeros(1, 1, config.hidden_dim)
+        )
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, config.num_patches, config.hidden_dim)
+        )
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        self.blocks = nn.ModuleList(
+            [
+                DecoderBlock(
+                    dim=config.hidden_dim,
+                    num_heads=config.num_heads,
+                    mlp_ratio=config.mlp_ratio,
+                    dropout=config.dropout,
+                )
+                for _ in range(config.depth)
+            ]
+        )
+
+        self.norm = nn.LayerNorm(config.hidden_dim)
+
+        patch_dim = (
+            config.patch_size
+            * config.patch_size
+            * config.in_channels
+        )
+        self.head = nn.Linear(config.hidden_dim, patch_dim)
+
+    def forward(self, memory: torch.Tensor) -> torch.Tensor:
+        batch_size = memory.shape[0]
+
+        x = self.mask_token.expand(batch_size, -1, -1)
+        x = x + self.pos_embed
+
+        for block in self.blocks:
+            x = block(x, memory)
+
+        x = self.norm(x)
+        x = self.head(x)
+
+        side = self.patches_per_side
+        p = self.patch_size
+        c = self.in_channels
+
+        x = x.reshape(batch_size, side, side, p, p, c)
+        x = x.permute(0, 5, 1, 3, 2, 4)
+        return x.reshape(batch_size, c, side * p, side * p)

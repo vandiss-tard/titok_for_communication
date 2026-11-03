@@ -1,0 +1,9 @@
+# Install PyTorch/torchvision first with the build matching the server CUDA version.
+# Example: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.4
+torchvision>=0.19
+
+Pillow>=10.0
+lpips==0.1.4
+numpy>=1.24
+scipy>=1.10

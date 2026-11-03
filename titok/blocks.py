@@ -312,3 +312,25 @@ class LatentDecoder(nn.Module):
         x = x.reshape(batch_size, side, side, p, p, c)
         x = x.permute(0, 5, 1, 3, 2, 4)
         return x.reshape(batch_size, c, side * p, side * p)
+
+
+class TiTok(nn.Module):
+    """完整的图像编码、量化和重建模型。"""
+
+    def __init__(self, config: TiTokConfig) -> None:
+        super().__init__()
+
+        self.config = config
+        self.encoder = LatentEncoder(config)
+        self.quantizer = VectorQuantizer(config)
+        self.decoder = LatentDecoder(config)
+
+    def forward(
+        self,
+        images: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        latents = self.encoder(images)
+        quantized, indices, vq_loss = self.quantizer(latents)
+        reconstruction = self.decoder(quantized)
+
+        return reconstruction, indices, vq_loss

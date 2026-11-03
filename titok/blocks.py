@@ -334,3 +334,14 @@ class TiTok(nn.Module):
         reconstruction = self.decoder(quantized)
 
         return reconstruction, indices, vq_loss
+    
+    @torch.no_grad()
+    def encode(self, images: torch.Tensor) -> torch.Tensor:
+        latents = self.encoder(images)
+        _, indices, _ = self.quantizer(latents)
+        return indices
+
+    @torch.no_grad()
+    def decode(self, indices: torch.Tensor) -> torch.Tensor:
+        quantized = self.quantizer.lookup(indices)
+        return self.decoder(quantized)
